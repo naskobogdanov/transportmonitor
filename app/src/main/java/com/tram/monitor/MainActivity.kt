@@ -90,18 +90,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun initSession() {
+        android.util.Log.d("TRAM", "initSession called")
         val req = Request.Builder().url("https://www.sofiatraffic.bg/bg/").get().build()
         client.newCall(req).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
+                android.util.Log.e("TRAM", "initSession FAILED: ${e.message}")
                 handler.postDelayed({ initSession() }, 5000)
             }
             override fun onResponse(call: Call, response: Response) {
+                android.util.Log.d("TRAM", "initSession HTTP ${response.code}")
+                android.util.Log.d("TRAM", "Cookies: ${response.headers("Set-Cookie")}")
                 response.headers("Set-Cookie").forEach { header ->
                     if (header.contains("XSRF-TOKEN")) {
                         val raw = header.substringAfter("XSRF-TOKEN=").substringBefore(";")
                         xsrf = URLDecoder.decode(raw, "UTF-8")
                     }
                 }
+                android.util.Log.d("TRAM", "XSRF result: '$xsrf'")
                 response.close()
                 scheduleRefresh()
             }
@@ -109,7 +114,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun fetchStop(stopId: String, adapter: TramAdapter) {
-        if (xsrf.isEmpty()) return
+        if (xsrf.isEmpty()) { android.util.Log.e("TRAM", "fetchStop $stopId skipped - no xsrf"); return }
+        android.util.Log.d("TRAM", "fetchStop $stopId xsrf=${xsrf.take(15)}")
         val json = """{"stop":"$stopId","type":2}"""
         val body = json.toRequestBody("application/json".toMediaType())
         val req = Request.Builder()
@@ -119,35 +125,35 @@ class MainActivity : AppCompatActivity() {
             .header("X-XSRF-TOKEN", xsrf)
             .build()
         client.newCall(req).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {}
+            override fun onFailure(call: Call, e: IOException) {
+                android.util.Log.e("TRAM", "fetchStop $stopId FAILED: ${e.message}")
+            }
             override fun onResponse(call: Call, response: Response) {
                 val code = response.code
                 val respBody = response.body?.string() ?: run { response.close(); return }
+                android.util.Log.d("TRAM", "fetchStop $stopId HTTP=$code body=${respBody.take(300)}")
                 response.close()
-                if (code == 419 || code == 403) {
-                    xsrf = ""
-                    handler.post { initSession() }
-                    return
-                }
+                if (code == 419 || code == 403) { xsrf = ""; handler.post { initSession() }; return }
                 try {
                     val arr = JSONArray(respBody)
                     val lines = (0 until arr.length()).map { i ->
                         val obj = arr.getJSONObject(i)
                         val name = obj.getString("name")
                         val details = obj.getJSONArray("details")
-                        val times = (0 until details.length())
-                            .map { j -> details.getJSONObject(j).getInt("t") }
+                        val times = (0 until details.length()).map { j -> details.getJSONObject(j).getInt("t") }
                         TramLine(name, times)
                     }
+                    android.util.Log.d("TRAM", "fetchStop $stopId parsed ${lines.size} lines")
                     handler.post { adapter.update(lines) }
                 } catch (e: Exception) {
+                    android.util.Log.e("TRAM", "fetchStop $stopId parse error: ${e.message}")
                     xsrf = ""
                     handler.post { initSession() }
                 }
             }
         })
     }
-
+    
     private fun scheduleRefresh() {
         refreshRunnable?.let { handler.removeCallbacks(it) }
         val r = object : Runnable {
