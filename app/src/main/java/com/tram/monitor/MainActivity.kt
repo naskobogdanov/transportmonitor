@@ -3,13 +3,17 @@ package com.tram.monitor
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import androidx.appcompat.app.AppCompatActivity
-import androidx.recyclerview.widget.LinearLayoutManager
-import androidx.recyclerview.widget.RecyclerView
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import android.widget.TextView
+import androidx.appcompat.app.AppCompatActivity
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -57,9 +61,6 @@ class MainActivity : AppCompatActivity() {
         .cookieJar(object : CookieJar {
             override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
                 android.util.Log.d("TRAM", "Saving ${cookies.size} cookies for ${url.host}")
-                cookies.forEach {
-                    android.util.Log.d("TRAM", "  Cookie: ${it.name}=${it.value.take(30)}")
-                }
                 val existing = cookieStore[url.host]?.associateBy { it.name }?.toMutableMap()
                     ?: mutableMapOf()
                 cookies.forEach { existing[it.name] = it }
@@ -107,88 +108,76 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun initSession(retryDelay: Long = 16_000L) {
-        android.util.Log.d("TRAM", "initSession called")
+        android.util.Log.d("TRAM", "initSession called via WebView")
 
-        // Step 1: hit the homepage first to get cookies
-        val req = Request.Builder()
-            .url("https://www.sofiatraffic.bg/bg/")
-            .header("User-Agent", UA)
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-            .header("Accept-Language", "bg,en-US;q=0.7,en;q=0.3")
-            .header("Accept-Encoding", "gzip, deflate, br")
-            .header("Connection", "keep-alive")
-            .header("Upgrade-Insecure-Requests", "1")
-            .header("Sec-Fetch-Dest", "document")
-            .header("Sec-Fetch-Mode", "navigate")
-            .header("Sec-Fetch-Site", "none")
-            .header("Sec-Fetch-User", "?1")
-            .get()
-            .build()
+        // Must run on main thread — WebView requires it
+        handler.post {
+            val webView = WebView(this)
+            webView.settings.javaScriptEnabled = true
+            webView.settings.userAgentString = UA
+            // Keep it invisible — user never sees it
+            webView.visibility = View.GONE
 
-        client.newCall(req).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                android.util.Log.e("TRAM", "initSession FAILED: ${e.message}")
-                val next = minOf(retryDelay * 2, 300_000L)
-                handler.postDelayed({ initSession(next) }, retryDelay)
-            }
+            webView.webViewClient = object : WebViewClient() {
 
-            override fun onResponse(call: Call, response: Response) {
-                val code = response.code
-                response.body?.string() // consume body fully so connection is reused
-                response.close()
-                android.util.Log.d("TRAM", "initSession HTTP $code")
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    android.util.Log.d("TRAM", "WebView loaded: $url")
 
-                if (code == 429) {
-                    val next = minOf(retryDelay * 2, 300_000L)
-                    android.util.Log.w("TRAM", "Rate limited! Retrying in ${next / 1000}s")
-                    handler.postDelayed({ initSession(next) }, next)
-                    return
+                    // Pull all cookies WebView received from the server
+                    val wvCookies = android.webkit.CookieManager.getInstance()
+                        .getCookie("https://www.sofiatraffic.bg") ?: ""
+
+                    android.util.Log.d("TRAM", "WebView cookies: ${wvCookies.take(300)}")
+
+                    // Inject them into OkHttp's cookie store
+                    wvCookies.split(";").forEach { pair ->
+                        val parts = pair.trim().split("=", limit = 2)
+                        if (parts.size == 2) {
+                            val name = parts[0].trim()
+                            val value = parts[1].trim()
+                            val cookie = Cookie.Builder()
+                                .domain("www.sofiatraffic.bg")
+                                .path("/")
+                                .name(name)
+                                .value(value)
+                                .build()
+                            val existing = cookieStore["www.sofiatraffic.bg"]
+                                ?.associateBy { it.name }?.toMutableMap() ?: mutableMapOf()
+                            existing[name] = cookie
+                            cookieStore["www.sofiatraffic.bg"] = existing.values.toList()
+                        }
+                    }
+
+                    val xsrf = getXsrf()
+                    android.util.Log.d("TRAM", "XSRF from WebView: '${xsrf.take(20)}'")
+
+                    // Destroy WebView — no longer needed
+                    view?.destroy()
+
+                    if (xsrf.isEmpty()) {
+                        android.util.Log.w("TRAM", "No XSRF from WebView, retrying in ${retryDelay / 1000}s")
+                        handler.postDelayed({ initSession(retryDelay) }, retryDelay)
+                    } else {
+                        scheduleRefresh()
+                    }
                 }
 
-                val xsrf = getXsrf()
-                android.util.Log.d("TRAM", "XSRF after init: '${xsrf.take(20)}'")
-
-                if (xsrf.isEmpty()) {
-                    android.util.Log.w("TRAM", "No XSRF yet, retrying in ${retryDelay / 1000}s")
-                    handler.postDelayed({ initSession(retryDelay) }, retryDelay)
-                    return
+                override fun onReceivedError(
+                    view: WebView?,
+                    request: WebResourceRequest?,
+                    error: WebResourceError?
+                ) {
+                    if (request?.isForMainFrame == true) {
+                        android.util.Log.e("TRAM", "WebView error: ${error?.description}")
+                        view?.destroy()
+                        val next = minOf(retryDelay * 2, 300_000L)
+                        handler.postDelayed({ initSession(next) }, retryDelay)
+                    }
                 }
-
-                // Step 2: wait 1.5s then hit the tram page to simulate real navigation
-                handler.postDelayed({
-                    warmUpTramPage(retryDelay)
-                }, 1500L)
-            }
-        })
-    }
-
-    // Visit the actual tram page before making XHR calls — mimics real browser navigation
-    private fun warmUpTramPage(retryDelay: Long) {
-        val req = Request.Builder()
-            .url("https://www.sofiatraffic.bg/bg/transport/tramway")
-            .header("User-Agent", UA)
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-            .header("Accept-Language", "bg,en-US;q=0.7,en;q=0.3")
-            .header("Referer", "https://www.sofiatraffic.bg/bg/")
-            .header("Sec-Fetch-Dest", "document")
-            .header("Sec-Fetch-Mode", "navigate")
-            .header("Sec-Fetch-Site", "same-origin")
-            .get()
-            .build()
-
-        client.newCall(req).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                android.util.Log.w("TRAM", "warmUp FAILED (non-fatal): ${e.message}")
-                scheduleRefresh() // proceed anyway
             }
 
-            override fun onResponse(call: Call, response: Response) {
-                android.util.Log.d("TRAM", "warmUp HTTP ${response.code}")
-                response.body?.string()
-                response.close()
-                scheduleRefresh()
-            }
-        })
+            webView.loadUrl("https://www.sofiatraffic.bg/bg/")
+        }
     }
 
     private fun getXsrf(): String {
