@@ -49,6 +49,10 @@ class MainActivity : AppCompatActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private val cookieStore = HashMap<String, List<Cookie>>()
 
+    companion object {
+        private const val UA = "Mozilla/5.0 (Linux; Android 13; Redmi Note 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+    }
+
     private val client = OkHttpClient.Builder()
         .cookieJar(object : CookieJar {
             override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
@@ -56,7 +60,6 @@ class MainActivity : AppCompatActivity() {
                 cookies.forEach {
                     android.util.Log.d("TRAM", "  Cookie: ${it.name}=${it.value.take(30)}")
                 }
-                // Merge, don't replace — keep existing cookies not in new response
                 val existing = cookieStore[url.host]?.associateBy { it.name }?.toMutableMap()
                     ?: mutableMapOf()
                 cookies.forEach { existing[it.name] = it }
@@ -71,7 +74,6 @@ class MainActivity : AppCompatActivity() {
         })
         .build()
 
-    // Stop IDs — adjust to your actual stops
     private val STOP_A = "1711"
     private val STOP_B = "1703"
 
@@ -104,13 +106,22 @@ class MainActivity : AppCompatActivity() {
         handler.removeCallbacksAndMessages(null)
     }
 
-    private fun initSession(retryDelay: Long = 8000L) {
+    private fun initSession(retryDelay: Long = 16_000L) {
         android.util.Log.d("TRAM", "initSession called")
+
+        // Step 1: hit the homepage first to get cookies
         val req = Request.Builder()
             .url("https://www.sofiatraffic.bg/bg/")
-            .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; Redmi) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36")
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-            .header("Accept-Language", "bg,en;q=0.9")
+            .header("User-Agent", UA)
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+            .header("Accept-Language", "bg,en-US;q=0.7,en;q=0.3")
+            .header("Accept-Encoding", "gzip, deflate, br")
+            .header("Connection", "keep-alive")
+            .header("Upgrade-Insecure-Requests", "1")
+            .header("Sec-Fetch-Dest", "document")
+            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Site", "none")
+            .header("Sec-Fetch-User", "?1")
             .get()
             .build()
 
@@ -123,8 +134,9 @@ class MainActivity : AppCompatActivity() {
 
             override fun onResponse(call: Call, response: Response) {
                 val code = response.code
-                android.util.Log.d("TRAM", "initSession HTTP $code")
+                response.body?.string() // consume body fully so connection is reused
                 response.close()
+                android.util.Log.d("TRAM", "initSession HTTP $code")
 
                 if (code == 429) {
                     val next = minOf(retryDelay * 2, 300_000L)
@@ -139,9 +151,42 @@ class MainActivity : AppCompatActivity() {
                 if (xsrf.isEmpty()) {
                     android.util.Log.w("TRAM", "No XSRF yet, retrying in ${retryDelay / 1000}s")
                     handler.postDelayed({ initSession(retryDelay) }, retryDelay)
-                } else {
-                    scheduleRefresh()
+                    return
                 }
+
+                // Step 2: wait 1.5s then hit the tram page to simulate real navigation
+                handler.postDelayed({
+                    warmUpTramPage(retryDelay)
+                }, 1500L)
+            }
+        })
+    }
+
+    // Visit the actual tram page before making XHR calls — mimics real browser navigation
+    private fun warmUpTramPage(retryDelay: Long) {
+        val req = Request.Builder()
+            .url("https://www.sofiatraffic.bg/bg/transport/tramway")
+            .header("User-Agent", UA)
+            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+            .header("Accept-Language", "bg,en-US;q=0.7,en;q=0.3")
+            .header("Referer", "https://www.sofiatraffic.bg/bg/")
+            .header("Sec-Fetch-Dest", "document")
+            .header("Sec-Fetch-Mode", "navigate")
+            .header("Sec-Fetch-Site", "same-origin")
+            .get()
+            .build()
+
+        client.newCall(req).enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) {
+                android.util.Log.w("TRAM", "warmUp FAILED (non-fatal): ${e.message}")
+                scheduleRefresh() // proceed anyway
+            }
+
+            override fun onResponse(call: Call, response: Response) {
+                android.util.Log.d("TRAM", "warmUp HTTP ${response.code}")
+                response.body?.string()
+                response.close()
+                scheduleRefresh()
             }
         })
     }
@@ -177,12 +222,17 @@ class MainActivity : AppCompatActivity() {
         val req = Request.Builder()
             .url("https://www.sofiatraffic.bg/bg/trip/getVirtualTable")
             .post(body)
-            .header("User-Agent", "Mozilla/5.0 (Linux; Android 13; Redmi) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36")
+            .header("User-Agent", UA)
             .header("Accept", "application/json, text/javascript, */*; q=0.01")
-            .header("Accept-Language", "bg,en;q=0.9")
+            .header("Accept-Language", "bg,en-US;q=0.7,en;q=0.3")
+            .header("Content-Type", "application/json")
             .header("X-Requested-With", "XMLHttpRequest")
             .header("X-XSRF-TOKEN", xsrf)
-            .header("Referer", "https://www.sofiatraffic.bg/bg/")
+            .header("Origin", "https://www.sofiatraffic.bg")
+            .header("Referer", "https://www.sofiatraffic.bg/bg/transport/tramway")
+            .header("Sec-Fetch-Dest", "empty")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("Sec-Fetch-Site", "same-origin")
             .build()
 
         client.newCall(req).enqueue(object : Callback {
