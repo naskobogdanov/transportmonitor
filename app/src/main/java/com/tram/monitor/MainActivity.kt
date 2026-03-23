@@ -171,7 +171,7 @@ class MainActivity : AppCompatActivity() {
         }
         android.util.Log.d("TRAM", "fetchStop $stopId xsrf=${xsrf.take(20)}")
 
-        val json = """{"stop_id":"$stopId","type":"1"}"""
+        val json = """{"stop":"$stopId","type":2}"""
         val body = json.toRequestBody("application/json; charset=utf-8".toMediaType())
 
         val req = Request.Builder()
