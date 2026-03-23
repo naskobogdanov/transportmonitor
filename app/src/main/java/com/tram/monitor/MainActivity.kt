@@ -10,6 +10,7 @@ import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.webkit.CookieManager
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
@@ -110,26 +111,34 @@ class MainActivity : AppCompatActivity() {
     private fun initSession(retryDelay: Long = 16_000L) {
         android.util.Log.d("TRAM", "initSession called via WebView")
 
-        // Must run on main thread — WebView requires it
         handler.post {
+            // Enable cookies before creating WebView
+            CookieManager.getInstance().apply {
+                setAcceptCookie(true)
+            }
+
             val webView = WebView(this)
             webView.settings.javaScriptEnabled = true
             webView.settings.userAgentString = UA
-            // Keep it invisible — user never sees it
             webView.visibility = View.GONE
+
+            // Enable third-party cookies on this specific WebView instance
+            CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
             webView.webViewClient = object : WebViewClient() {
 
                 override fun onPageFinished(view: WebView?, url: String?) {
                     android.util.Log.d("TRAM", "WebView loaded: $url")
 
-                    // Pull all cookies WebView received from the server
-                    val wvCookies = android.webkit.CookieManager.getInstance()
+                    // Flush cookies to disk first
+                    CookieManager.getInstance().flush()
+
+                    val wvCookies = CookieManager.getInstance()
                         .getCookie("https://www.sofiatraffic.bg") ?: ""
 
                     android.util.Log.d("TRAM", "WebView cookies: ${wvCookies.take(300)}")
 
-                    // Inject them into OkHttp's cookie store
+                    // Inject cookies into OkHttp cookie store
                     wvCookies.split(";").forEach { pair ->
                         val parts = pair.trim().split("=", limit = 2)
                         if (parts.size == 2) {
@@ -151,7 +160,6 @@ class MainActivity : AppCompatActivity() {
                     val xsrf = getXsrf()
                     android.util.Log.d("TRAM", "XSRF from WebView: '${xsrf.take(20)}'")
 
-                    // Destroy WebView — no longer needed
                     view?.destroy()
 
                     if (xsrf.isEmpty()) {
