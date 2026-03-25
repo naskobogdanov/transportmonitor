@@ -76,6 +76,10 @@ class MainActivity : AppCompatActivity() {
                         val key = keys.next()
                         val entry = obj.getJSONObject(key)
                         val lineName = entry.getString("name")
+                    
+                        // For stop B, show only line 42
+                        if (stopId == STOP_B && lineName != "42") continue
+                    
                         val details = entry.getJSONArray("details")
                         val times = (0 until details.length()).map { j ->
                             details.getJSONObject(j).getInt("t")
