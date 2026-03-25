@@ -84,8 +84,17 @@ class MainActivity : AppCompatActivity() {
                         val times = (0 until details.length()).map { j ->
                             details.getJSONObject(j).getInt("t")
                         }
-                        lines.add(TramLine(lineName, times))
+                    
+                        // Merge with existing entry if same line name
+                        val existing = lines.indexOfFirst { it.name == lineName }
+                        if (existing >= 0) {
+                            val merged = (lines[existing].times + times).sorted().distinct()
+                            lines[existing] = TramLine(lineName, merged)
+                        } else {
+                            lines.add(TramLine(lineName, times))
+                        }
                     }
+                    
                     android.util.Log.d("TRAM", "stop=$stopId parsed ${lines.size} lines")
 
                     val timeStr = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
