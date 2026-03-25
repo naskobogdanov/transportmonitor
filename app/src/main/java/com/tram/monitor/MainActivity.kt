@@ -6,6 +6,7 @@ import android.os.Looper
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.webkit.JavascriptInterface
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
@@ -15,12 +16,8 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
-import okhttp3.*
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
-import java.io.IOException
-import java.net.URLDecoder
+import org.json.JSONObject
 
 data class TramLine(val name: String, val times: List<Int>)
 
@@ -52,37 +49,69 @@ class TramAdapter(private var items: List<TramLine>) :
 class MainActivity : AppCompatActivity() {
 
     private val handler = Handler(Looper.getMainLooper())
-    private val cookieStore = HashMap<String, List<Cookie>>()
 
     companion object {
         private const val UA = "Mozilla/5.0 (Linux; Android 13; Redmi Note 11) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+        private const val REFRESH_MS = 30_000L
+        private const val STOP_A = "1711"
+        private const val STOP_B = "1703"
     }
 
-    private val client = OkHttpClient.Builder()
-        .cookieJar(object : CookieJar {
-            override fun saveFromResponse(url: HttpUrl, cookies: List<Cookie>) {
-                android.util.Log.d("TRAM", "Saving ${cookies.size} cookies for ${url.host}")
-                val existing = cookieStore[url.host]?.associateBy { it.name }?.toMutableMap()
-                    ?: mutableMapOf()
-                cookies.forEach { existing[it.name] = it }
-                cookieStore[url.host] = existing.values.toList()
-            }
-
-            override fun loadForRequest(url: HttpUrl): List<Cookie> {
-                val cookies = cookieStore[url.host] ?: emptyList()
-                android.util.Log.d("TRAM", "Loading ${cookies.size} cookies for ${url.host}")
-                return cookies
-            }
-        })
-        .build()
-
-    private val STOP_A = "1711"
-    private val STOP_B = "1703"
-
+    private lateinit var webView: WebView
     private lateinit var adapterA: TramAdapter
     private lateinit var adapterB: TramAdapter
 
-    private val REFRESH_MS = 30_000L
+    // Flag to prevent multiple simultaneous fetch cycles
+    private var isFetching = false
+
+    inner class TramBridge {
+        @JavascriptInterface
+        fun onStopData(stopId: String, json: String) {
+            android.util.Log.d("TRAM", "onStopData stop=$stopId json=${json.take(200)}")
+            handler.post {
+                isFetching = false
+                try {
+                    val arr = JSONArray(json)
+                    val lines = (0 until arr.length()).map { i ->
+                        val obj = arr.getJSONObject(i)
+                        val lineName = obj.getString("name")
+                        val details = obj.getJSONArray("details")
+                        val times = (0 until details.length()).map { j ->
+                            details.getJSONObject(j).getInt("t")
+                        }
+                        TramLine(lineName, times)
+                    }
+                    android.util.Log.d("TRAM", "stop=$stopId parsed ${lines.size} lines")
+                    if (stopId == STOP_A) adapterA.update(lines)
+                    else adapterB.update(lines)
+                } catch (e: Exception) {
+                    android.util.Log.e("TRAM", "parse error stop=$stopId: ${e.message}")
+                }
+            }
+        }
+
+        @JavascriptInterface
+        fun onError(stopId: String, status: Int, body: String) {
+            android.util.Log.w("TRAM", "onError stop=$stopId status=$status body=${body.take(200)}")
+            handler.post {
+                isFetching = false
+                // Back off and reload page to get fresh XSRF
+                handler.postDelayed({
+                    android.util.Log.d("TRAM", "Reloading WebView after error")
+                    webView.loadUrl("https://www.sofiatraffic.bg/bg/")
+                }, 15_000L)
+            }
+        }
+
+        @JavascriptInterface
+        fun onPageReady() {
+            android.util.Log.d("TRAM", "onPageReady — scheduling first fetch")
+            handler.post {
+                // Small delay to let JS/cookies settle
+                handler.postDelayed({ doFetch() }, 1000L)
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -100,177 +129,113 @@ class MainActivity : AppCompatActivity() {
             adapter = adapterB
         }
 
-        initSession()
+        setupWebView()
     }
 
     override fun onDestroy() {
         super.onDestroy()
         handler.removeCallbacksAndMessages(null)
+        webView.destroy()
     }
 
-    private fun initSession(retryDelay: Long = 16_000L) {
-        android.util.Log.d("TRAM", "initSession called via WebView")
+    private fun setupWebView() {
+        CookieManager.getInstance().apply {
+            setAcceptCookie(true)
+        }
 
-        handler.post {
-            // Enable cookies before creating WebView
-            CookieManager.getInstance().apply {
-                setAcceptCookie(true)
-            }
+        webView = WebView(this)
+        webView.visibility = View.GONE
+        webView.settings.javaScriptEnabled = true
+        webView.settings.userAgentString = UA
+        webView.settings.domStorageEnabled = true
 
-            val webView = WebView(this)
-            webView.settings.javaScriptEnabled = true
-            webView.settings.userAgentString = UA
-            webView.visibility = View.GONE
+        CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
 
-            // Enable third-party cookies on this specific WebView instance
-            CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
+        webView.addJavascriptInterface(TramBridge(), "TramBridge")
 
-            webView.webViewClient = object : WebViewClient() {
+        webView.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(view: WebView?, url: String?) {
+                android.util.Log.d("TRAM", "WebView page finished: $url")
 
-                override fun onPageFinished(view: WebView?, url: String?) {
-                    android.util.Log.d("TRAM", "WebView loaded: $url")
-
-                    // Flush cookies to disk first
-                    CookieManager.getInstance().flush()
-
-                    val wvCookies = CookieManager.getInstance()
-                        .getCookie("https://www.sofiatraffic.bg") ?: ""
-
-                    android.util.Log.d("TRAM", "WebView cookies: ${wvCookies.take(300)}")
-
-                    // Inject cookies into OkHttp cookie store
-                    wvCookies.split(";").forEach { pair ->
-                        val parts = pair.trim().split("=", limit = 2)
-                        if (parts.size == 2) {
-                            val name = parts[0].trim()
-                            val value = parts[1].trim()
-                            val cookie = Cookie.Builder()
-                                .domain("www.sofiatraffic.bg")
-                                .path("/")
-                                .name(name)
-                                .value(value)
-                                .build()
-                            val existing = cookieStore["www.sofiatraffic.bg"]
-                                ?.associateBy { it.name }?.toMutableMap() ?: mutableMapOf()
-                            existing[name] = cookie
-                            cookieStore["www.sofiatraffic.bg"] = existing.values.toList()
+                // Inject JS that posts to the API and returns data via the bridge
+                val js = """
+                    (function() {
+                        function getXsrf() {
+                            var match = document.cookie.match(/XSRF-TOKEN=([^;]+)/);
+                            if (!match) return '';
+                            try { return decodeURIComponent(match[1]); } catch(e) { return match[1]; }
                         }
-                    }
 
-                    val xsrf = getXsrf()
-                    android.util.Log.d("TRAM", "XSRF from WebView: '${xsrf.take(20)}'")
-
-                    view?.destroy()
-
-                    if (xsrf.isEmpty()) {
-                        android.util.Log.w("TRAM", "No XSRF from WebView, retrying in ${retryDelay / 1000}s")
-                        handler.postDelayed({ initSession(retryDelay) }, retryDelay)
-                    } else {
-                        scheduleRefresh()
-                    }
-                }
-
-                override fun onReceivedError(
-                    view: WebView?,
-                    request: WebResourceRequest?,
-                    error: WebResourceError?
-                ) {
-                    if (request?.isForMainFrame == true) {
-                        android.util.Log.e("TRAM", "WebView error: ${error?.description}")
-                        view?.destroy()
-                        val next = minOf(retryDelay * 2, 300_000L)
-                        handler.postDelayed({ initSession(next) }, retryDelay)
-                    }
-                }
-            }
-
-            webView.loadUrl("https://www.sofiatraffic.bg/bg/")
-        }
-    }
-
-    private fun getXsrf(): String {
-        val cookies = cookieStore["www.sofiatraffic.bg"] ?: return ""
-        val raw = cookies.find { it.name == "XSRF-TOKEN" }?.value ?: return ""
-        return try {
-            URLDecoder.decode(raw, "UTF-8")
-        } catch (e: Exception) {
-            raw
-        }
-    }
-
-    private fun scheduleRefresh() {
-        fetchStop(STOP_A, adapterA)
-        fetchStop(STOP_B, adapterB)
-        handler.postDelayed({ scheduleRefresh() }, REFRESH_MS)
-    }
-
-    private fun fetchStop(stopId: String, adapter: TramAdapter) {
-        val xsrf = getXsrf()
-        if (xsrf.isEmpty()) {
-            android.util.Log.e("TRAM", "fetchStop $stopId skipped - no xsrf, re-initing")
-            initSession()
-            return
-        }
-        android.util.Log.d("TRAM", "fetchStop $stopId xsrf=${xsrf.take(20)}")
-
-        val json = """{"stop":"$stopId","type":2}"""
-        val body = json.toRequestBody("application/json; charset=utf-8".toMediaType())
-
-        val req = Request.Builder()
-            .url("https://www.sofiatraffic.bg/bg/trip/getVirtualTable")
-            .post(body)
-            .header("User-Agent", UA)
-            .header("Accept", "application/json, text/javascript, */*; q=0.01")
-            .header("Accept-Language", "bg,en-US;q=0.7,en;q=0.3")
-            .header("Content-Type", "application/json")
-            .header("X-Requested-With", "XMLHttpRequest")
-            .header("X-XSRF-TOKEN", xsrf)
-            .header("Origin", "https://www.sofiatraffic.bg")
-            .header("Referer", "https://www.sofiatraffic.bg/bg/transport/tramway")
-            .header("Sec-Fetch-Dest", "empty")
-            .header("Sec-Fetch-Mode", "cors")
-            .header("Sec-Fetch-Site", "same-origin")
-            .build()
-
-        client.newCall(req).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) {
-                android.util.Log.e("TRAM", "fetchStop $stopId FAILED: ${e.message}")
-            }
-
-            override fun onResponse(call: Call, response: Response) {
-                val code = response.code
-                val respBody = response.body?.string() ?: run { response.close(); return }
-                android.util.Log.d("TRAM", "fetchStop $stopId HTTP=$code body=${respBody.take(400)}")
-                response.close()
-
-                when (code) {
-                    419, 403, 429 -> {
-                        android.util.Log.w("TRAM", "fetchStop $stopId auth error $code, re-init")
-                        cookieStore.clear()
-                        handler.post { initSession() }
-                        return
-                    }
-                }
-
-                try {
-                    val arr = JSONArray(respBody)
-                    val lines = (0 until arr.length()).map { i ->
-                        val obj = arr.getJSONObject(i)
-                        val lineName = obj.getString("name")
-                        val details = obj.getJSONArray("details")
-                        val times = (0 until details.length()).map { j ->
-                            details.getJSONObject(j).getInt("t")
+                        function fetchStop(stopId) {
+                            var xsrf = getXsrf();
+                            if (!xsrf) {
+                                TramBridge.onError(stopId, 0, 'no xsrf');
+                                return;
+                            }
+                            fetch('https://www.sofiatraffic.bg/bg/trip/getVirtualTable', {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'X-Requested-With': 'XMLHttpRequest',
+                                    'X-XSRF-TOKEN': xsrf,
+                                    'Accept': 'application/json, text/javascript, */*; q=0.01'
+                                },
+                                body: JSON.stringify({stop: stopId, type: 2})
+                            })
+                            .then(function(r) {
+                                if (!r.ok) {
+                                    r.text().then(function(t) {
+                                        TramBridge.onError(stopId, r.status, t);
+                                    });
+                                    return;
+                                }
+                                return r.json();
+                            })
+                            .then(function(data) {
+                                if (data) TramBridge.onStopData(stopId, JSON.stringify(data));
+                            })
+                            .catch(function(e) {
+                                TramBridge.onError(stopId, -1, e.toString());
+                            });
                         }
-                        TramLine(lineName, times)
-                    }
-                    android.util.Log.d("TRAM", "fetchStop $stopId OK: ${lines.size} lines")
-                    handler.post { adapter.update(lines) }
-                } catch (e: Exception) {
-                    android.util.Log.e("TRAM", "fetchStop $stopId parse error: ${e.message} | body: ${respBody.take(200)}")
-                    cookieStore.clear()
-                    handler.post { initSession() }
+
+                        window._fetchStop = fetchStop;
+                        TramBridge.onPageReady();
+                    })();
+                """.trimIndent()
+
+                view?.evaluateJavascript(js, null)
+            }
+
+            override fun onReceivedError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                error: WebResourceError?
+            ) {
+                if (request?.isForMainFrame == true) {
+                    android.util.Log.e("TRAM", "WebView error: ${error?.description}")
+                    handler.postDelayed({
+                        webView.loadUrl("https://www.sofiatraffic.bg/bg/")
+                    }, 30_000L)
                 }
             }
-        })
+        }
+
+        webView.loadUrl("https://www.sofiatraffic.bg/bg/")
+    }
+
+    private fun doFetch() {
+        if (isFetching) return
+        isFetching = true
+        android.util.Log.d("TRAM", "doFetch — calling JS fetchStop for both stops")
+
+        // Fetch both stops sequentially via JS, 2s apart to avoid rate limiting
+        webView.evaluateJavascript("window._fetchStop('$STOP_A')", null)
+        handler.postDelayed({
+            webView.evaluateJavascript("window._fetchStop('$STOP_B')", null)
+        }, 2000L)
+
+        // Schedule next refresh
+        handler.postDelayed({ doFetch() }, REFRESH_MS)
     }
 }
