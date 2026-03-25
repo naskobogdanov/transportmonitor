@@ -71,15 +71,18 @@ class MainActivity : AppCompatActivity() {
             handler.post {
                 isFetching = false
                 try {
-                    val arr = JSONArray(json)
-                    val lines = (0 until arr.length()).map { i ->
-                        val obj = arr.getJSONObject(i)
-                        val lineName = obj.getString("name")
-                        val details = obj.getJSONArray("details")
+                    val obj = JSONObject(json)
+                    val lines = mutableListOf<TramLine>()
+                    val keys = obj.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        val entry = obj.getJSONObject(key)
+                        val lineName = entry.getString("name")
+                        val details = entry.getJSONArray("details")
                         val times = (0 until details.length()).map { j ->
                             details.getJSONObject(j).getInt("t")
                         }
-                        TramLine(lineName, times)
+                        lines.add(TramLine(lineName, times))
                     }
                     android.util.Log.d("TRAM", "stop=$stopId parsed ${lines.size} lines")
                     if (stopId == STOP_A) adapterA.update(lines)
