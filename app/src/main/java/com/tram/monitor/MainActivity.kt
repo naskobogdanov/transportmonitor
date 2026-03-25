@@ -3,9 +3,9 @@ package com.tram.monitor
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+import android.view.LayoutInflater
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -14,11 +14,10 @@ import android.webkit.WebViewClient
 import android.webkit.CookieManager
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.WindowCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
-import org.json.JSONArray
 import org.json.JSONObject
-import androidx.core.view.WindowCompat
 
 data class TramLine(val name: String, val times: List<Int>)
 
@@ -61,8 +60,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var adapterA: TramAdapter
     private lateinit var adapterB: TramAdapter
-
-    // Flag to prevent multiple simultaneous fetch cycles
     private var isFetching = false
 
     inner class TramBridge {
@@ -86,10 +83,10 @@ class MainActivity : AppCompatActivity() {
                         lines.add(TramLine(lineName, times))
                     }
                     android.util.Log.d("TRAM", "stop=$stopId parsed ${lines.size} lines")
-        
+
                     val timeStr = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
                         .format(java.util.Date())
-        
+
                     if (stopId == STOP_A) {
                         adapterA.update(lines)
                         findViewById<TextView>(R.id.tvStopAUpdated).text = "обновено $timeStr"
@@ -97,7 +94,6 @@ class MainActivity : AppCompatActivity() {
                         adapterB.update(lines)
                         findViewById<TextView>(R.id.tvStopBUpdated).text = "обновено $timeStr"
                     }
-        
                 } catch (e: Exception) {
                     android.util.Log.e("TRAM", "parse error stop=$stopId: ${e.message}")
                 }
@@ -109,7 +105,6 @@ class MainActivity : AppCompatActivity() {
             android.util.Log.w("TRAM", "onError stop=$stopId status=$status body=${body.take(200)}")
             handler.post {
                 isFetching = false
-                // Back off and reload page to get fresh XSRF
                 handler.postDelayed({
                     android.util.Log.d("TRAM", "Reloading WebView after error")
                     webView.loadUrl("https://www.sofiatraffic.bg/bg/")
@@ -121,7 +116,6 @@ class MainActivity : AppCompatActivity() {
         fun onPageReady() {
             android.util.Log.d("TRAM", "onPageReady — scheduling first fetch")
             handler.post {
-                // Small delay to let JS/cookies settle
                 handler.postDelayed({ doFetch() }, 1000L)
             }
         }
@@ -129,13 +123,16 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Full screen immersive
-        WindowCompat.setDecorFitsSystemWindows(window, false)
-        window.insetsController?.apply {
-            hide(android.view.WindowInsets.Type.statusBars() or android.view.WindowInsets.Type.navigationBars())
-            systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
-        }
         setContentView(R.layout.activity_main)
+
+        // Full screen — AFTER setContentView
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        window.decorView.post {
+            window.insetsController?.apply {
+                hide(android.view.WindowInsets.Type.statusBars() or android.view.WindowInsets.Type.navigationBars())
+                systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            }
+        }
 
         adapterA = TramAdapter(emptyList())
         adapterB = TramAdapter(emptyList())
@@ -159,9 +156,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupWebView() {
-        CookieManager.getInstance().apply {
-            setAcceptCookie(true)
-        }
+        CookieManager.getInstance().setAcceptCookie(true)
 
         webView = WebView(this)
         webView.visibility = View.GONE
@@ -170,14 +165,12 @@ class MainActivity : AppCompatActivity() {
         webView.settings.domStorageEnabled = true
 
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, true)
-
         webView.addJavascriptInterface(TramBridge(), "TramBridge")
 
         webView.webViewClient = object : WebViewClient() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 android.util.Log.d("TRAM", "WebView page finished: $url")
 
-                // Inject JS that posts to the API and returns data via the bridge
                 val js = """
                     (function() {
                         function getXsrf() {
@@ -249,13 +242,11 @@ class MainActivity : AppCompatActivity() {
         isFetching = true
         android.util.Log.d("TRAM", "doFetch — calling JS fetchStop for both stops")
 
-        // Fetch both stops sequentially via JS, 2s apart to avoid rate limiting
         webView.evaluateJavascript("window._fetchStop('$STOP_A')", null)
         handler.postDelayed({
             webView.evaluateJavascript("window._fetchStop('$STOP_B')", null)
         }, 2000L)
 
-        // Schedule next refresh
         handler.postDelayed({ doFetch() }, REFRESH_MS)
     }
 }
