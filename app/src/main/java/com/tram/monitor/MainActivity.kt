@@ -18,6 +18,7 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import org.json.JSONArray
 import org.json.JSONObject
+import androidx.core.view.WindowCompat
 
 data class TramLine(val name: String, val times: List<Int>)
 
@@ -85,8 +86,18 @@ class MainActivity : AppCompatActivity() {
                         lines.add(TramLine(lineName, times))
                     }
                     android.util.Log.d("TRAM", "stop=$stopId parsed ${lines.size} lines")
-                    if (stopId == STOP_A) adapterA.update(lines)
-                    else adapterB.update(lines)
+        
+                    val timeStr = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+                        .format(java.util.Date())
+        
+                    if (stopId == STOP_A) {
+                        adapterA.update(lines)
+                        findViewById<TextView>(R.id.tvStopAUpdated).text = "обновено $timeStr"
+                    } else {
+                        adapterB.update(lines)
+                        findViewById<TextView>(R.id.tvStopBUpdated).text = "обновено $timeStr"
+                    }
+        
                 } catch (e: Exception) {
                     android.util.Log.e("TRAM", "parse error stop=$stopId: ${e.message}")
                 }
@@ -118,6 +129,12 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Full screen immersive
+        WindowCompat.setDecorFitsSystemWindows(window, false)
+        window.insetsController?.apply {
+            hide(android.view.WindowInsets.Type.statusBars() or android.view.WindowInsets.Type.navigationBars())
+            systemBarsBehavior = android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        }
         setContentView(R.layout.activity_main)
 
         adapterA = TramAdapter(emptyList())
